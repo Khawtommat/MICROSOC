@@ -1,0 +1,11 @@
+*.db
+*.db-journal
+log-sentinel-report.txt
+dashboard.html
+smart_report_*/
+*.log
+!sample-auth-*.log
+*.tmp
+test_*.sh
+.DS_Store
+Thumbs.db
