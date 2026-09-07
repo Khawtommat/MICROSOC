@@ -11,16 +11,16 @@
 # วิธีใช้:
 #   ./micro_soc_report.sh                       (ใช้ microsoc.db ในโฟลเดอร์ปัจจุบัน)
 #   ./micro_soc_report.sh -d /path/microsoc.db -o dashboard.html
-#   LINE_NOTIFY_TOKEN="xxxx" ./micro_soc_report.sh --line
+#   LINE_CHANNEL_TOKEN="xxxx" ./micro_soc_report.sh --line
 #
 # ตัวเลือก:
 #   -d  path ไฟล์ SQLite database (default: microsoc.db)
 #   -o  path ไฟล์ HTML dashboard ที่จะสร้าง (default: dashboard.html)
-#   --line   ส่งสรุปเข้า LINE Notify ด้วย (ต้องตั้ง env var LINE_NOTIFY_TOKEN)
+#   --line   ส่งสรุปเข้า LINE ด้วย (ต้องตั้ง env var LINE_CHANNEL_TOKEN)
 #   -h  แสดงวิธีใช้
 #
 # ตั้ง cron ส่งสรุปทุกเช้า 07:00:
-#   0 7 * * *  LINE_NOTIFY_TOKEN="xxxx" /path/micro_soc_report.sh --line
+#   0 7 * * *  LINE_CHANNEL_TOKEN="xxxx" /path/micro_soc_report.sh --line
 # ==========================================================
 
 set -uo pipefail
@@ -39,12 +39,12 @@ micro_soc_report.sh — ศูนย์บัญชาการ (Central Hub / D
 วิธีใช้:
   ./micro_soc_report.sh                       (ใช้ microsoc.db ในโฟลเดอร์ปัจจุบัน)
   ./micro_soc_report.sh -d /path/microsoc.db -o dashboard.html
-  LINE_NOTIFY_TOKEN="xxxx" ./micro_soc_report.sh --line
+  LINE_CHANNEL_TOKEN="xxxx" ./micro_soc_report.sh --line
 
 ตัวเลือก:
   -d  path ไฟล์ SQLite database (default: microsoc.db)
   -o  path ไฟล์ HTML dashboard ที่จะสร้าง (default: dashboard.html)
-  --line   ส่งสรุปเข้า LINE Notify ด้วย (ต้องตั้ง env var LINE_NOTIFY_TOKEN)
+  --line   ส่งสรุปเข้า LINE ด้วย (ต้องตั้ง env var LINE_CHANNEL_TOKEN)
   -h  แสดงวิธีใช้
 EOF
     exit "${1:-0}"
@@ -152,6 +152,7 @@ cat <<HTML > "$OUTPUT_FILE"
         <tr><th>IP</th><th>จำนวนครั้งพลาด</th><th>สถานะ</th><th>เวลาที่พบล่าสุด</th><th>พบทั้งหมด</th></tr>
 HTML
 
+#ดึงข้อมูล Log Sentinel (ประวัติการถูกโจมตี)
 ROWS=$(Q "SELECT l.ip, l.fail_count, l.action, l.detected_at, c.cnt
     FROM ips_logs l
     JOIN (SELECT ip, COUNT(*) cnt FROM ips_logs GROUP BY ip) c ON c.ip = l.ip
@@ -160,8 +161,7 @@ ROWS=$(Q "SELECT l.ip, l.fail_count, l.action, l.detected_at, c.cnt
 if [ -z "$ROWS" ]; then
     echo '<tr><td colspan="5" class="empty">ยังไม่มีข้อมูล — รัน log_sentinel.sh ก่อน</td></tr>' >> "$OUTPUT_FILE"
 else
-    while IFS='|' read -r ip count action detected times_seen; do
-        badge_class="badge-alerted"
+    while IFS='|' read -r ip count action detected times_seen; do        badge_class="badge-alerted"
         [ "$action" = "banned" ] && badge_class="badge-banned"
         cat <<EOF >> "$OUTPUT_FILE"
             <tr><td>$ip</td><td>$count</td><td><span class="badge $badge_class">$action</span></td><td>$detected</td><td>${times_seen}×</td></tr>
@@ -206,18 +206,32 @@ echo -e "${GREEN}Dashboard generated: ${OUTPUT_FILE}${NC}"
 # ----------------------------------------------------------
 
 if [ "${SEND_LINE:-0}" -eq 1 ]; then
-    if [ -z "${LINE_NOTIFY_TOKEN:-}" ]; then
-        echo -e "${RED}ไม่พบ env var LINE_NOTIFY_TOKEN — ข้ามการแจ้งเตือน${NC}" >&2
-        exit 1
+    TOKEN="${LINE_CHANNEL_TOKEN:-${LINE_NOTIFY_TOKEN:-}}"
+    if [ -z "$TOKEN" ]; then
+        echo -e "${RED}ไม่พบ env var LINE_CHANNEL_TOKEN — ข้ามการแจ้งเตือน${NC}" >&2
     elif ! command -v curl >/dev/null 2>&1; then
-        echo -e "${RED}[!] ไม่พบ curl — ข้ามการแจ้งเตือน${NC}"
+        echo -e "${RED}[!] ไม่พบ curl — ข้ามการแจ้งเตือน${NC}" >&2
     else
-        MSG=$'\n🛡️ Micro-SOC สรุปประจำวัน '"$TODAY"$'\n'"แบนวันนี้: $BANNED_TODAY | พอร์ตใหม่วันนี้: $NEW_PORTS_TODAY | แจ้งเตือนสะสม: $TOTAL_ALERTS"
-    # ตัวอย่างสำหรับ LINE Messaging API (Push Message) — ต้องมี CHANNEL_ACCESS_TOKEN และ USER_ID จริง
-    curl -s -X POST "https://api.line.me/v2/bot/message/broadcast" \
-    -H "Authorization: Bearer $LINE_NOTIFY_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "{\"messages\":[{\"type\":\"text\",\"text\":$(printf '%s' "$MSG" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}]}" \
-    >/dev/null && echo -e "${GREEN}ส่งสรุปเข้า LINE เรียบร้อย${NC}" || echo -e "${RED}[!] ส่ง LINE ไม่สำเร็จ ตรวจสอบ token${NC}"
+        DATE_DISPLAY=$(date +'%d/%m/%Y')
+        MSG="🛡️ Micro-SOC สรุปประจำวัน ${DATE_DISPLAY}
+แบนวันนี้: ${BANNED_TODAY} | พอร์ตใหม่วันนี้: ${NEW_PORTS_TODAY} | แจ้งเตือนสะสม: ${TOTAL_ALERTS}"
+
+        PAYLOAD=$(printf '%s' "$MSG" | python3 -c \
+            'import json,sys; print(json.dumps({"messages":[{"type":"text","text":sys.stdin.read()}]}))')
+
+        RESP=$(curl -s -w '\n%{http_code}' -X POST \
+            "https://api.line.me/v2/bot/message/broadcast" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+        HTTP_CODE=$(printf '%s' "$RESP" | tail -n1)
+        BODY=$(printf '%s' "$RESP" | sed '$d')
+
+        if [ "$HTTP_CODE" = "200" ]; then
+            echo -e "${GREEN}ส่งสรุปเข้า LINE เรียบร้อย${NC}"
+        else
+            echo -e "${RED}[!] ส่ง LINE ไม่สำเร็จ (HTTP ${HTTP_CODE}): ${BODY}${NC}" >&2
+        fi
     fi
 fi
