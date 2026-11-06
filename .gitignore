@@ -9,3 +9,4 @@ smart_report_*/
 test_*.sh
 .DS_Store
 Thumbs.db
+*.env
