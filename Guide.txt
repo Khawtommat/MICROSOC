@@ -1,0 +1,521 @@
+===========================================================================
+  คู่มือการใช้งาน Micro-SOC
+  ระบบ: Log Sentinel (IPS) + Smart Recon (CASM) + IP Intelligence + Dashboard/Notifier
+  Creator: Khawtommat
+===========================================================================
+
+ภาพรวมระบบ
+---------------------------------------------------------------------------
+Micro-SOC ประกอบด้วย 5 ไฟล์หลัก ทำงานร่วมกันผ่านฐานข้อมูล SQLite ตัวเดียว
+(ค่าเริ่มต้นชื่อ microsoc.db ซึ่งสร้าง schema ให้อัตโนมัติ ไม่ต้องรัน
+schema.sql เองก็ได้):
+
+  1. MICROSOC.sh         -> ตัวรันหลัก (interactive) เรียก 4 ตัวล่างให้ครบ
+  2. Log_Sentinel.sh      -> สแกน log หา IP ที่ login ผิดพลาดถี่ + Auto-Ban
+  3. Smart_Recon.sh       -> สแกนพอร์ต/เซอร์วิสเป้าหมาย + web recon
+  4. IP_Intel.sh          -> เสริมข้อมูล IP ที่น่าสงสัย (RDAP/GeoIP/AbuseIPDB
+                             + Risk Score) — stage เสริม ไม่บังคับ
+  5. Micro_SOC_Report.sh  -> สร้าง Dashboard HTML + export + แจ้งเตือน Telegram
+
+  schema.sql              -> โครงสร้างตารางหลัก (อ้างอิง/รันมือก็ได้ ไม่บังคับ)
+  schema_ip_intel.sql     -> โครงสร้างตารางเสริมของ IP_Intel.sh (apply
+                             อัตโนมัติทุกครั้งที่ IP_Intel.sh รัน)
+
+ความต้องการของระบบ (dependencies)
+---------------------------------------------------------------------------
+  จำเป็นเสมอ      : sqlite3, nmap, python3, bash
+                      (python3 ใช้โดย Smart_Recon.sh สำหรับแปลงผล Nmap XML
+                      เป็นโครงสร้างข้อมูล และโดย IP_Intel.sh สำหรับคำนวณ
+                      Risk Score — ไม่ใช่ตัวเลือก ต้องมีเสมอ)
+  ใช้เมื่อเปิดฟีเจอร์ : iptables / ip6tables (Auto-Ban — มีตัวใดตัวหนึ่งก็พอ)
+                      curl       (ส่งแจ้งเตือนเข้า Telegram, เรียก RDAP/GeoIP/
+                                  AbuseIPDB ของ IP_Intel.sh)
+                      gobuster, nikto (web recon — เลือกใช้ได้ไม่บังคับ)
+
+ติดตั้งบน Ubuntu/Debian เช่น:
+  sudo apt install sqlite3 nmap iptables curl python3 gobuster nikto
+
+ก่อนใช้งานครั้งแรก ต้องให้สิทธิ์รันไฟล์ทั้งหมด:
+  chmod +x MICROSOC.sh Log_Sentinel.sh Smart_Recon.sh IP_Intel.sh Micro_SOC_Report.sh
+
+
+===========================================================================
+1) MICROSOC.sh — ตัวรันหลัก (แนะนำให้ใช้ตัวนี้ตัวเดียวพอ)
+===========================================================================
+
+วิธีใช้:
+  ./MICROSOC.sh
+  sudo ./MICROSOC.sh        (ต้องใช้ sudo ถ้าจะเปิด Auto-Ban)
+
+เป็นสคริปต์แบบถาม-ตอบ (interactive) ไม่มี flag ให้ใส่ตอนเรียก รันแล้วจะถาม
+ตามลำดับนี้:
+
+  1. ไฟล์ log ที่จะตรวจสอบ            เช่น /var/log/auth.log
+  2. Threshold จำนวนครั้ง login ผิด    [Enter = ใช้ค่า default 5]
+  3. ขนาด time window (วินาที)        [Enter = ใช้ค่า default 600]
+  4. IP หรือ domain ของเป้าหมายที่จะสแกน
+  5. เปิด Auto-Ban ด้วย iptables/ip6tables ไหม (y/N)   -- ต้องรันด้วย sudo ถึงจะเปิดได้
+     ถ้าตอบ y จะถามต่ออีก 2 ข้อก่อนเริ่มสแกนจริง:
+       5a. ระบุไฟล์ Allowlist (-A) กัน IP ไม่ให้ถูกแบน (เว้นว่างเพื่อข้าม — ไม่บังคับ)
+       5b. ให้พิมพ์ "YES" (ตัวพิมพ์ใหญ่ทั้งหมด) เพื่อยืนยันว่าจะแก้ไข firewall จริง
+           ถ้าไม่พิมพ์ YES ตรงตามนี้ ระบบจะรัน Auto-Ban แบบ Dry-run เท่านั้น
+           (แค่โชว์ว่า "จะ" บล็อก IP ไหน ไม่แตะ firewall จริง) เป็นค่าเริ่มต้นเสมอ
+           เพื่อกันการบล็อก IP พลาดโดยไม่ตั้งใจ
+  6. เปิดโหมดลดภาระเครื่อง/เครือข่าย (y/N)   -- low-impact + gentle scan
+  7. รัน Nmap Deep Scan ด้วยไหม (y/N)
+  8. เลือก Web Recon: 1) Gobuster 2) Nikto 3) ทั้งคู่ 4) ข้าม
+  9. Export ผลลัพธ์เป็นไฟล์ไหม: csv / json / none  [Enter = csv]
+  10. ส่งสรุปเข้า Telegram ไหม (y/N)   -- ต้องตั้ง TELEGRAM_BOT_TOKEN และ
+      TELEGRAM_CHAT_ID ไว้ก่อน (ดูวิธีตั้งค่าในหัวข้อ Micro_SOC_Report.sh ด้านล่าง)
+  11. ต้องการรัน IP Intelligence & Threat Investigation ด้วยไหม (y/N)   -- ถาม
+      เฉพาะตอนเจอไฟล์ IP_Intel.sh อยู่ในโฟลเดอร์เดียวกัน ถ้าตอบ y จะรัน
+      IP_Intel.sh ให้อัตโนมัติ (ส่ง --telegram ต่อให้ด้วยถ้าข้อ 10 ตอบ y)
+
+ลำดับการรันจริงเมื่อเปิด IP Intelligence: Log_Sentinel.sh -> Smart_Recon.sh
+-> IP_Intel.sh -> Micro_SOC_Report.sh (รันก่อน Report เสมอ เพื่อให้
+dashboard.html มีลิงก์ไปหน้า ip_investigation.html ได้ทันทีตั้งแต่รอบแรก)
+IP_Intel.sh เป็น stage เสริม ถ้า error จะไม่กระทบสถานะรวม SUCCESS/PARTIAL/
+FAILED ของ 3 stage หลัก
+
+เมื่อรันจบจะได้:
+  - dashboard.html             (เปิดดูด้วย browser ได้เลย มีปุ่ม "กลับไป
+                                Dashboard" อยู่ทุกหน้ารายงานย่อย)
+  - ip_investigation.html      (ถ้าเปิด IP Intelligence — มีลิงก์จาก dashboard)
+  - exports/*.csv หรือ *.json  (ถ้าเลือก export)
+  - microsoc.db                (ฐานข้อมูลสะสมผลทุกครั้งที่รัน)
+
+ตัวอย่างการใช้งานจริง:
+---------------------------------------------------------------------------
+ตัวอย่าง 1: เช็ค auth.log ของเครื่อง + สแกนเซิร์ฟเวอร์ 192.168.1.10 แบบไม่เปิด
+Auto-Ban ไม่ส่ง Telegram ไม่เปิด IP Intelligence (ทดสอบระบบก่อนใช้งานจริง)
+
+  $ ./MICROSOC.sh
+  ระบุไฟล์ log ที่ต้องการตรวจสอบ: /var/log/auth.log
+  Threshold จำนวนครั้ง login ผิดพลาด [default: 5]: <Enter>
+  ขนาด time window วินาที [default: 600]: <Enter>
+  ระบุ IP ของเป้าหมาย: 192.168.1.10
+  ต้องการเปิด Auto-Ban: n
+  ต้องการลดภาระเครื่อง/เน็ตเวิร์ก: n
+  ต้องการรัน Nmap Deep Scan: n
+  เลือกเมนู Web Recon [1-4]: 4
+  Export ผลลัพธ์: csv
+  ต้องการส่งสรุปเข้า Telegram: n
+  ต้องการรัน IP Intelligence & Threat Investigation: n
+
+ตัวอย่าง 2: ใช้งานจริงบน production server ที่มีการโจมตีถี่ ต้องการ Auto-Ban
+ทันที สแกนลึก ส่งแจ้งเตือนเข้า Telegram พร้อมลดภาระเครื่อง และเปิด IP
+Intelligence เพื่อดูว่า IP ที่โจมตีมาจากประเทศ/องค์กรไหน เสี่ยงแค่ไหน
+
+  $ export TELEGRAM_BOT_TOKEN="123456:ABC-xxx"
+  $ export TELEGRAM_CHAT_ID="123456789"
+  $ sudo -E ./MICROSOC.sh
+  ระบุไฟล์ log: /var/log/auth.log
+  Threshold: 3
+  time window: 300
+  IP เป้าหมาย: 10.0.0.5
+  เปิด Auto-Ban: y
+  ระบุไฟล์ Allowlist (-A): <Enter>          (ไม่ใช้ allowlist รอบนี้)
+  พิมพ์ YES เพื่อยืนยันการบล็อกจริง: YES     (ต้องพิมพ์ "YES" ตัวใหญ่ล้วน
+                                              ไม่งั้นจะได้แค่ dry-run)
+  ลดภาระเครื่อง: y
+  Deep Scan: y
+  Web Recon: 3 (ทั้งคู่)
+  Export: json
+  ต้องการส่งสรุปเข้า Telegram: y
+  ต้องการรัน IP Intelligence & Threat Investigation: y
+
+  หมายเหตุ:
+  - ใช้ sudo -E (ไม่ใช่ sudo เฉยๆ) เพื่อให้ env var TELEGRAM_BOT_TOKEN และ
+    TELEGRAM_CHAT_ID ที่ export ไว้ ถูกส่งต่อเข้าไปใน sudo session ด้วย
+  - ถ้าลืมพิมพ์ "YES" ให้ตรงตามนี้ (เช่นพิมพ์ "y" หรือ "yes" ตัวเล็ก) ระบบจะไม่
+    แก้ไข firewall จริง แค่โชว์ dry-run เป็นการป้องกันการบล็อก IP พลาด
+
+
+===========================================================================
+2) Log_Sentinel.sh — ตรวจจับ IP login ผิดพลาดถี่ + Auto-Ban
+===========================================================================
+
+ใช้แบบรันเดี่ยวๆ ได้ (ไม่ต้องผ่าน MICROSOC.sh) เหมาะกับการตั้ง cron
+
+วิธีใช้:
+  ./Log_Sentinel.sh -f <ไฟล์ log> [options]
+
+ตัวเลือก (flags):
+  -f  path ไฟล์ log (บังคับใส่เสมอ)                 เช่น -f /var/log/auth.log
+  -t  threshold จำนวนครั้ง                           default: 5
+  -w  ขนาด time window เป็นวินาที                    default: 600 (10 นาที)
+  -o  ไฟล์รายงานผลลัพธ์ (.txt)                       default: log-sentinel-report.txt
+  -d  path ไฟล์ SQLite database                      default: microsoc.db
+  -b  เปิดโหมด Auto-Ban (สั่ง iptables/ip6tables จริง) ต้องรันด้วย sudo/root
+  -n  Dry-run (โชว์คำสั่งที่ "จะ" รัน แต่ไม่รันจริง)
+  -A  path ไฟล์ Allowlist (1 IP หรือ IPv4 CIDR ต่อบรรทัด, '#' คอมเมนต์ได้)
+      IP ใน allowlist จะไม่ถูก Auto-Ban เด็ดขาด (ยังคงบันทึกว่า "alerted" ปกติ)
+      127.0.0.1 และ ::1 อยู่ใน allowlist เสมอโดย default แม้ไม่ระบุ -A
+  -L  Low-impact mode (renice/ionice ลด priority ของ process)
+  -h  แสดงวิธีใช้
+
+รองรับทั้ง IPv4 (ผ่าน iptables) และ IPv6 (ผ่าน ip6tables) เลือกใช้คำสั่งที่
+ตรงกับชนิดของ IP ให้อัตโนมัติ — ถ้าเจอ IP ชนิดที่ไม่มีเครื่องมือรองรับบนเครื่อง
+(เช่นเจอ IPv6 แต่ไม่มี ip6tables) จะข้ามการแบน IP นั้นแบบมีเหตุผลชัดเจน
+ไม่ error ทั้งสคริปต์
+
+รองรับไฟล์ log ที่ถูก gzip ไว้ (.gz) อ่านได้โดยไม่ต้องแตกไฟล์ก่อน
+
+Exit code: 0 = สแกนและบันทึกผลลง Database สำเร็จ / 1 = error ร้ายแรง (เช่น
+argument ผิด, ไม่มีเครื่องมือที่จำเป็น) / 2 = สแกนสำเร็จ แต่บันทึกผลลง
+Database ไม่สำเร็จ (เช่น path เขียนไม่ได้) — ใช้แยกแยะ partial failure ได้
+เวลาเรียกจาก cron หรือจาก MICROSOC.sh
+
+ตัวอย่างการใช้งาน:
+---------------------------------------------------------------------------
+ตัวอย่าง 1: เช็คแบบพื้นฐานที่สุด ใช้ค่า default ทั้งหมด ไม่เปิด Auto-Ban
+(เหมาะกับการทดสอบ หรือรันดูผลครั้งแรก)
+
+  $ ./Log_Sentinel.sh -f /var/log/auth.log
+
+ตัวอย่าง 2: เข้มงวดขึ้น เจอ 3 ครั้งใน 5 นาทีก็แจ้งเตือนทันที
+
+  $ ./Log_Sentinel.sh -f /var/log/auth.log -t 3 -w 300
+
+ตัวอย่าง 3: เปิด Auto-Ban จริง บล็อกผ่าน iptables ทันทีที่เจอ IP ต้องสงสัย
+(ต้องใช้ sudo เพราะ iptables ต้องการสิทธิ์ root)
+
+  $ sudo ./Log_Sentinel.sh -f /var/log/auth.log -b
+
+ตัวอย่าง 4: ทดสอบ Auto-Ban แบบ Dry-run ก่อน (ดูว่าคำสั่งที่จะรันคืออะไร
+โดยไม่บล็อกจริง) ปลอดภัยสำหรับทดสอบบนเซิร์ฟเวอร์ที่ใช้งานจริงอยู่
+
+  $ sudo ./Log_Sentinel.sh -f /var/log/auth.log -b -n
+
+ตัวอย่าง 5: อ่านไฟล์ log เก่าที่ถูก gzip ไว้ และลด priority ของ process
+ตัวเองไม่ให้แย่ง resource เครื่อง (เหมาะกับเครื่องที่ resource จำกัด)
+
+  $ ./Log_Sentinel.sh -f /var/log/auth.log.2.gz -L
+
+ตัวอย่าง 6: ใช้ database คนละไฟล์ และตั้งชื่อรายงานเอง (เช่นแยกฐานข้อมูล
+ของแต่ละลูกค้า/แต่ละเซิร์ฟเวอร์)
+
+  $ ./Log_Sentinel.sh -f /var/log/auth.log -d client_a.db -o client_a_report.txt
+
+ตัวอย่าง 7: เปิด Auto-Ban จริง แต่กัน IP ทีม/VPN/monitoring ไว้ไม่ให้โดนแบน
+พลาด ด้วยไฟล์ allowlist (1 IP หรือ CIDR ต่อบรรทัด)
+
+  $ cat allowlist.txt
+  10.0.0.0/8
+  203.0.113.50
+
+  $ sudo ./Log_Sentinel.sh -f /var/log/auth.log -b -A allowlist.txt
+
+ตั้ง cron ให้สแกนทุก 10 นาที (ไม่เปิด Auto-Ban แค่แจ้งเตือนอย่างเดียว):
+  */10 * * * *  /path/Log_Sentinel.sh -f /var/log/auth.log >> /var/log/microsoc_cron.log 2>&1
+
+ตั้ง cron ให้สแกน + Auto-Ban จริง ทุก 5 นาที (ต้อง root):
+  */5 * * * *  root  /path/Log_Sentinel.sh -f /var/log/auth.log -b -L
+
+
+===========================================================================
+3) Smart_Recon.sh — สแกนพอร์ต/เซอร์วิส + Web Recon แบบ Delta Reporting
+===========================================================================
+
+ใช้ได้ 2 โหมด: interactive (ถามทีละขั้น) กับ non-interactive (สำหรับ cron)
+
+วิธีใช้ (โหมด interactive):
+  ./Smart_Recon.sh <TARGET>
+
+วิธีใช้ (โหมด non-interactive / cron):
+  ./Smart_Recon.sh <TARGET> --non-interactive [options]
+
+<TARGET> คือ IP หรือ domain ของเป้าหมาย ต้องใส่เป็นตัวแรกเสมอ
+
+ตัวเลือก (เฉพาะโหมด non-interactive):
+  --non-interactive   ไม่ถามอะไรเลย ใช้ค่าที่ระบุจาก flag ทั้งหมด (จำเป็นสำหรับ cron)
+  --deep              รัน Nmap Deep Scan (-sC -sV -Pn) ต่อจาก fast scan
+  --web=<ค่า>         เลือก web recon tool: gobuster | nikto | both | skip
+  --db=<path>         path ไฟล์ SQLite database  default: microsoc.db
+  --gentle            สแกนช้าลง (nmap -T2, gobuster threads น้อยลง)
+                      ลดภาระฝั่ง target ที่ถูกสแกน
+  --low-impact        ลด CPU/IO priority ของ process ตัวเอง (renice/ionice)
+  -h, --help          แสดงวิธีใช้
+
+ผลลัพธ์ที่ได้ทุกครั้ง: โฟลเดอร์ smart_report_<target>_<วันที่เวลา>/ ข้างในมี
+  NMAP_FAST.log / NMAP_DEEP.log, GOBUSTER.log, NIKTO.txt, report.html
+
+ทุกหน้า HTML ที่โฟลเดอร์นี้สร้าง (report.html, GOBUSTER_*.html, NIKTO_*.html)
+มีปุ่ม "กลับไป Dashboard" ให้กดย้อนกลับไปหน้า dashboard.html ได้ทันที
+(โชว์เฉพาะตอนที่เจอ dashboard.html อยู่จริงในโฟลเดอร์แม่)
+
+Smart Alerting: จะแจ้งเตือนเฉพาะตอนเจอ "พอร์ตใหม่" ที่ไม่เคยเห็นมาก่อน
+เท่านั้น (เทียบกับประวัติใน database) เพื่อลด alert fatigue
+
+เมื่อ Gobuster เจอ "wildcard response" (เซิร์ฟเวอร์ตอบ status code เดียวกัน
+ทุก path ไม่ว่าจะมีจริงหรือไม่) สคริปต์จะตัด status code นั้นออกจากรายการที่
+Gobuster นับเป็นผลที่เจอโดยอัตโนมัติ (เฉพาะเป้าหมายนั้น) status code อื่น
+ยังสแกน/รายงานได้ตามปกติ — path จริงที่บังเอิญตอบ status เดียวกับ wildcard
+จะถูกซ่อนไปด้วย เป็น trade-off ที่ยอมรับแล้วเพื่อลด false positive
+
+ตัวอย่างการใช้งาน:
+---------------------------------------------------------------------------
+ตัวอย่าง 1: โหมด interactive ถามทีละขั้น เหมาะกับการใช้งานมือ
+
+  $ ./Smart_Recon.sh 192.168.1.10
+  [จะถามว่าจะรัน Deep Scan ไหม, เลือก Web Recon tool ไหม ทีละขั้น]
+
+ตัวอย่าง 2: non-interactive แบบง่ายที่สุด แค่ fast scan ไม่ทำอะไรเพิ่ม
+(เหมาะกับการสแกนถี่ๆ เช่นทุกชั่วโมง)
+
+  $ ./Smart_Recon.sh 192.168.1.10 --non-interactive --web=skip
+
+ตัวอย่าง 3: สแกนลึกเต็มรูปแบบ พร้อม web recon ทั้ง Gobuster และ Nikto
+(เหมาะกับการสแกนรายวัน/รายสัปดาห์ที่ไม่รีบ)
+
+  $ ./Smart_Recon.sh example.com --non-interactive --deep --web=both
+
+ตัวอย่าง 4: สแกน target ที่เป็นเซิร์ฟเวอร์ production จริง ต้องการลดภาระ
+ทั้งฝั่งเครื่องที่รันสคริปต์และฝั่ง target ที่ถูกสแกน
+
+  $ ./Smart_Recon.sh 10.0.0.5 --non-interactive --deep --web=both --gentle --low-impact
+
+ตัวอย่าง 5: ใช้ database แยกเฉพาะของลูกค้ารายนี้
+
+  $ ./Smart_Recon.sh client-a.example.com --non-interactive --web=skip --db=client_a.db
+
+ตั้ง cron ให้สแกนทุกเที่ยงคืน (fast scan อย่างเดียว ไม่ทำ web scan):
+  0 0 * * *  /path/Smart_Recon.sh 192.168.1.10 --non-interactive --web=skip
+
+ตั้ง cron ให้สแกนลึกทุกวันอาทิตย์ตอนตี 2 แบบ gentle (ไม่รบกวน target มาก):
+  0 2 * * 0  /path/Smart_Recon.sh 192.168.1.10 --non-interactive --deep --web=both --gentle
+
+
+===========================================================================
+4) IP_Intel.sh — เสริมข้อมูล IP ที่น่าสงสัย (RDAP/GeoIP/AbuseIPDB + Risk Score)
+===========================================================================
+
+ดึง IP ที่พบจาก ips_logs (ผลงานของ Log_Sentinel.sh) มาเสริมข้อมูลให้ทีละตัว:
+  - RDAP/WHOIS (องค์กร, network range, abuse contact)
+  - GeoIP โดยประมาณ (ประเทศ/เมือง/timezone)
+  - IP Reputation ผ่าน AbuseIPDB (ถ้าตั้งค่า API key ไว้ — ไม่บังคับ)
+  - พฤติกรรมจาก Security Events ของเราเอง (fail count, เคยถูกแบนไหม ฯลฯ)
+  - Risk Score 0-100 พร้อมเหตุผลประกอบทุกแต้ม (rule-based ไม่ใช่ black-box)
+  - สร้างหน้า ip_investigation.html แยกต่างหาก (มีปุ่มกลับ Dashboard)
+  - แจ้งเตือน Telegram อัตโนมัติสำหรับ IP ความเสี่ยงสูง/วิกฤต (มี cooldown
+    กันสแปม ไม่ส่งซ้ำ IP เดิมถี่เกินไป)
+
+เป็นสคริปต์แยกต่างหาก ไม่แก้ไฟล์อื่นเลย อ่านจาก microsoc.db อย่างเดียวและ
+เขียนลงตารางใหม่ 4 ตารางที่ไม่ชนกับตารางเดิม (ดู schema_ip_intel.sql)
+เรียกแยกได้เอง หรือให้ MICROSOC.sh เรียกเป็นขั้นตอนเสริมก็ได้ (ข้อ 11 ใน
+หัวข้อ MICROSOC.sh ด้านบน)
+
+วิธีใช้:
+  ./IP_Intel.sh                       ตรวจ IP ที่พบล่าสุด 20 รายการใน ips_logs
+  ./IP_Intel.sh --limit 50            ตรวจ 50 รายการล่าสุด
+  ./IP_Intel.sh --check 1.2.3.4       ตรวจ IP เดียวแบบ manual (ไม่ต้องอยู่ใน log)
+  ./IP_Intel.sh --no-reputation       ข้าม AbuseIPDB (ใช้แค่ RDAP/GeoIP)
+  ./IP_Intel.sh --telegram            ส่งแจ้งเตือนเข้า Telegram สำหรับ IP เสี่ยงสูง
+  ./IP_Intel.sh -d /path/microsoc.db -o /path/ip_investigation.html
+
+ตัวเลือก (flags):
+  -d PATH             path ไฟล์ microsoc.db                 default: microsoc.db
+  -o PATH             path ไฟล์ HTML ที่จะสร้าง               default: ip_investigation.html
+  --limit N           จำนวน IP ล่าสุดจาก ips_logs ที่จะตรวจ    default: 20
+  --check IP          ตรวจ IP เดียวแบบ manual
+  --no-reputation     ข้ามการเรียก AbuseIPDB
+  --telegram          ส่งแจ้งเตือนเข้า Telegram สำหรับ IP ความเสี่ยงสูง/วิกฤต
+  -h                  แสดงวิธีใช้
+
+การตั้งค่า AbuseIPDB (ไม่บังคับ — ไม่ตั้งก็ใช้งานได้ปกติด้วย RDAP/GeoIP):
+  1. สมัครฟรีที่ abuseipdb.com เอา API key มา (free tier 1,000 request/วัน
+     ตลอดไป ไม่มีค่าใช้จ่าย ไม่ต้องผูกบัตรเครดิต)
+  2. สร้างไฟล์ ip_intel.env ไว้โฟลเดอร์เดียวกับสคริปต์นี้ (เหมือน telegram.env):
+       ABUSEIPDB_API_KEY="your_key_here"
+  3. ตั้งสิทธิ์ไฟล์ให้อ่านได้เฉพาะเจ้าของ:  chmod 600 ip_intel.env
+
+  *** ห้าม commit ไฟล์ ip_intel.env ขึ้น git เด็ดขาด มี API key อยู่ข้างใน ***
+
+ข้อจำกัดด้านเครือข่าย/ความเป็นส่วนตัว:
+  - Private/Loopback/Link-local/Reserved IP (127.x, 192.168.x, 10.x ฯลฯ)
+    จะไม่ถูกส่งไป external API เลยโดยเจตนา — บันทึกไว้ในตารางเฉยๆ ว่าเป็น
+    private ดังนั้น IP แบบนี้จะไม่มี Country/ASN/Org ขึ้นให้ (ตามคาด ไม่ใช่บั๊ก)
+  - มี timeout และจำกัดจำนวน IP ต่อรอบ (--limit) กัน rate-limit ของ API
+  - IP ที่เพิ่ง fetch ข้อมูลไปแล้วภายใน cache TTL (24 ชม. สำหรับ RDAP/GeoIP,
+    6 ชม. สำหรับ AbuseIPDB) จะไม่ถูกยิงซ้ำ ประหยัด quota ฟรีของ API
+
+External API ที่ใช้ (ทั้งหมดใช้ free tier ฟรี ไม่มีการเรียกเก็บเงินอัตโนมัติ):
+  rdap.org          RDAP/WHOIS lookup          ไม่ต้องมี key, ไม่จำกัด
+  ipapi.co          GeoIP lookup               ไม่ต้องมี key, ~1,000 req/วัน
+  api.abuseipdb.com IP reputation (ไม่บังคับ)   ต้องมี key, 1,000 req/วัน ฟรีตลอด
+  api.telegram.org  ส่งแจ้งเตือน                ต้องมี Bot Token, ฟรีตลอด
+
+ตัวอย่างการใช้งาน:
+---------------------------------------------------------------------------
+ตัวอย่าง 1: รันแบบง่ายที่สุด ตรวจ 20 IP ล่าสุดที่เจอใน ips_logs
+
+  $ ./IP_Intel.sh
+
+ตัวอย่าง 2: ตรวจ IP เดียวแบบ manual โดยไม่ต้องรอให้มันอยู่ใน log ก่อน
+(เหมาะเวลาอยากเช็ค IP ที่เพิ่งเจอจากที่อื่น เช่นจากไฟล์ log server อื่น)
+
+  $ ./IP_Intel.sh --check 203.0.113.77
+
+ตัวอย่าง 3: ตรวจ 100 IP ล่าสุด พร้อมส่งแจ้งเตือน Telegram ถ้าเจอความเสี่ยงสูง
+
+  $ export TELEGRAM_BOT_TOKEN="123456:ABC-xxx"
+  $ export TELEGRAM_CHAT_ID="123456789"
+  $ ./IP_Intel.sh --limit 100 --telegram
+
+ตัวอย่าง 4: ไม่มี/ไม่อยากใช้ AbuseIPDB ใช้แค่ RDAP/GeoIP พอ (เร็วกว่า ไม่ต้อง
+สมัคร API key เลย)
+
+  $ ./IP_Intel.sh --no-reputation
+
+ตั้ง cron ให้ตรวจ IP ใหม่ทุกชั่วโมง พร้อมแจ้งเตือน Telegram อัตโนมัติ:
+  0 * * * *  TELEGRAM_BOT_TOKEN="xxx" TELEGRAM_CHAT_ID="xxx" /path/IP_Intel.sh --telegram
+
+
+===========================================================================
+5) Micro_SOC_Report.sh — สร้าง Dashboard, Export รายงาน, แจ้งเตือน Telegram
+===========================================================================
+
+วิธีใช้:
+  ./Micro_SOC_Report.sh [options]
+
+ตัวเลือก:
+  -d  path ไฟล์ SQLite database                 default: microsoc.db
+  -o  path ไฟล์ HTML dashboard ที่จะสร้าง         default: dashboard.html
+  -e  export เป็นไฟล์เพิ่ม: csv หรือ json         (ไม่ใส่ = ไม่ export)
+  -x  โฟลเดอร์ปลายทางของไฟล์ export              default: exports
+  --telegram  ส่งสรุปเข้า Telegram (ต้องตั้ง env var TELEGRAM_BOT_TOKEN และ
+              TELEGRAM_CHAT_ID ก่อน)
+  -h  แสดงวิธีใช้
+
+หมายเหตุ: แฟล็ก --discord และ --line ถูกยกเลิกไปแล้ว สคริปต์จะเตือนให้ใช้
+--telegram แทนถ้าใส่แฟล็กเก่าสองตัวนี้มา (จะไม่ error แต่ก็จะไม่ส่งอะไรให้)
+
+Dashboard ที่ได้ (dashboard.html) มีข้อมูลครบ: การ์ดสรุปสถิติ, ตาราง IP ที่
+ตรวจพบล่าสุด, ตารางพอร์ต/เซอร์วิสที่ติดตามอยู่, กราฟแนวโน้มการแบน 7 วัน,
+Top 5 IP ที่โดนแจ้งเตือน/แบนบ่อยสุด, ประวัติการสแกนล่าสุด 10 ครั้ง, ผล
+Web Recon (Gobuster/Nikto) จาก Smart_Recon.sh และลิงก์ไปหน้า
+ip_investigation.html ถ้าเคยรัน IP_Intel.sh มาก่อน
+เป็นไฟล์ HTML เดี่ยวๆ เปิดด้วย browser ได้เลย ไม่ต้องต่อเน็ต
+
+วิธีตั้งค่า Telegram Bot:
+  1. คุยกับ @BotFather ใน Telegram แล้วพิมพ์ /newbot ทำตามขั้นตอนจนได้
+     Bot Token (รูปแบบประมาณ "123456:ABC-xxxxxxxxxxxxxxxxxxxxxxxx")
+  2. หา Chat ID ของตัวเอง/กลุ่มที่จะรับแจ้งเตือน เช่น คุยกับ @userinfobot
+     หรือส่งข้อความหา bot ของตัวเองสักครั้งแล้วเปิด
+     https://api.telegram.org/bot<TOKEN>/getUpdates เพื่อดู chat id
+  3. ตั้งเป็น environment variable ก่อนรันสคริปต์ เช่น:
+       export TELEGRAM_BOT_TOKEN="123456:ABC-xxx"
+       export TELEGRAM_CHAT_ID="123456789"
+     (อย่า hardcode ค่าเหล่านี้ลงในไฟล์สคริปต์โดยตรง เพราะเป็นข้อมูลลับ —
+     หรือจะสร้างไฟล์ telegram.env ไว้โฟลเดอร์เดียวกับสคริปต์แทนก็ได้ เหมือน
+     ip_intel.env ของ IP_Intel.sh ด้านบน)
+
+ตัวอย่างการใช้งาน:
+---------------------------------------------------------------------------
+ตัวอย่าง 1: สร้าง dashboard อย่างเดียว ไม่ export ไม่ส่ง Telegram
+
+  $ ./Micro_SOC_Report.sh
+
+ตัวอย่าง 2: สร้าง dashboard จาก database อื่น และตั้งชื่อไฟล์ output เอง
+
+  $ ./Micro_SOC_Report.sh -d client_a.db -o client_a_dashboard.html
+
+ตัวอย่าง 3: สร้าง dashboard พร้อม export เป็น CSV ไปไว้โฟลเดอร์ reports/
+
+  $ ./Micro_SOC_Report.sh -e csv -x reports
+
+ตัวอย่าง 4: สร้าง dashboard พร้อม export เป็น JSON และส่งสรุปเข้า Telegram
+
+  $ export TELEGRAM_BOT_TOKEN="123456:ABC-xxx"
+  $ export TELEGRAM_CHAT_ID="123456789"
+  $ ./Micro_SOC_Report.sh -e json --telegram
+
+ตั้ง cron ให้ส่งสรุปเข้า Telegram ทุกเช้า 07:00:
+  0 7 * * *  TELEGRAM_BOT_TOKEN="xxx" TELEGRAM_CHAT_ID="xxx" /path/Micro_SOC_Report.sh --telegram
+
+
+===========================================================================
+6) schema.sql / schema_ip_intel.sql — โครงสร้างฐานข้อมูล (อ้างอิง ไม่บังคับต้องรันเอง)
+===========================================================================
+
+ทุกสคริปต์ (Log_Sentinel.sh, Smart_Recon.sh, IP_Intel.sh) มีการสร้าง schema
+ของตัวเองให้อัตโนมัติอยู่แล้วตอนรันครั้งแรก (ถ้ายังไม่มีไฟล์ database) รวมถึง
+เติมคอลัมน์ที่ขาดให้ database เดิมแบบ self-healing ทุกครั้งที่รัน จึงไม่
+จำเป็นต้องรัน schema.sql เองก่อนใช้งาน แต่ถ้าต้องการสร้าง database เปล่า
+ล่วงหน้า หรือดูโครงสร้างตารางเพื่อเขียน query เพิ่มเอง สามารถรันได้ดังนี้:
+
+  $ sqlite3 microsoc.db < schema.sql
+  $ sqlite3 microsoc.db < schema_ip_intel.sql
+
+ตารางหลักในระบบ (schema.sql — 5 ตาราง):
+  ips_logs            เก็บ IP ที่ login ผิดพลาดเกินเกณฑ์ + สถานะการ Auto-Ban
+  recon_scans         metadata ของแต่ละรอบสแกน (target, scan_scope, status,
+                      จำนวนพอร์ตใหม่/ทั้งหมด) ใช้ทำ delta reporting
+  recon_assets        "สถานะปัจจุบัน" ของแต่ละพอร์ต/เซอร์วิส — 1 แถวต่อ
+                      (target, port, protocol) เท่านั้น อัปเดตทับทุกรอบสแกน
+  recon_port_history  ประวัติผลการพบพอร์ตแบบ append-only ทุกรอบสแกน (ไม่ update
+                      ทับเหมือน recon_assets) ใช้ตรวจสอบย้อนหลัง/เทียบรอบต่อรอบ
+  web_recon_results   ผล Gobuster (directory brute-force) และ Nikto (web vuln
+                      scan) ต่อ URL ที่สแกน
+
+ตารางเสริมของ IP_Intel.sh (schema_ip_intel.sql — 4 ตาราง แยกจากด้านบน
+ทั้งหมด ไม่ชนตารางเดิม):
+  ip_intelligence         RDAP/ASN/GeoIP ล่าสุดของแต่ละ IP (1 แถวต่อ IP)
+  ip_reputation           ผลจาก AbuseIPDB แต่ละครั้งที่ fetch (append-only)
+  ip_risk_assessments     ผลการให้คะแนนความเสี่ยงแต่ละครั้ง (append-only
+                          ดูย้อนหลังได้ว่าคะแนนเปลี่ยนไปอย่างไร)
+  ip_investigation_history  audit trail ทุกครั้งที่ตรวจสอบ IP หนึ่งๆ และเป็น
+                          ฐานของ Telegram alert cooldown
+
+ตัวอย่างการ query ข้อมูลเอง (ถ้าอยากดูข้อมูลแบบ custom นอกเหนือจาก dashboard):
+
+  ดู IP ที่ถูกแบนทั้งหมด:
+    $ sqlite3 microsoc.db "SELECT ip, banned_at FROM ips_logs WHERE action='banned';"
+
+  ดูเฉพาะพอร์ตที่ "เปิดอยู่ตอนนี้" ของเป้าหมายหนึ่ง (ไม่รวมพอร์ตที่เคยเปิด
+  แต่ปิด/filtered ไปแล้ว):
+    $ sqlite3 microsoc.db "SELECT port, service FROM recon_assets WHERE target='192.168.1.10' AND state='open';"
+
+  ดูประวัติการสแกนทั้งหมด เรียงจากล่าสุด:
+    $ sqlite3 microsoc.db "SELECT * FROM recon_scans ORDER BY scanned_at DESC;"
+
+  ดูผล Gobuster/Nikto ล่าสุดของเป้าหมายหนึ่ง:
+    $ sqlite3 microsoc.db "SELECT tool, url, status, findings_count FROM web_recon_results WHERE target='192.168.1.10' ORDER BY started_at DESC;"
+
+  ดู IP ที่มี Risk Score สูงสุด พร้อมเหตุผล:
+    $ sqlite3 microsoc.db "SELECT ip, risk_score, risk_level, reasons_json FROM ip_risk_assessments ORDER BY risk_score DESC LIMIT 10;"
+
+
+===========================================================================
+สรุปคำสั่งที่ใช้บ่อย (Quick Reference)
+===========================================================================
+
+  รันระบบทั้งชุดแบบถาม-ตอบ (แนะนำ)
+    ./MICROSOC.sh
+    sudo ./MICROSOC.sh                              (ถ้าจะเปิด Auto-Ban)
+
+  ตรวจ log อย่างเดียว ไม่เปิด Auto-Ban
+    ./Log_Sentinel.sh -f /var/log/auth.log
+
+  ตรวจ log + เปิด Auto-Ban จริง
+    sudo ./Log_Sentinel.sh -f /var/log/auth.log -b
+
+  สแกนเป้าหมายแบบเร็ว ไม่ทำ web scan
+    ./Smart_Recon.sh 192.168.1.10 --non-interactive --web=skip
+
+  สแกนเป้าหมายแบบลึก + web scan ทั้งคู่
+    ./Smart_Recon.sh 192.168.1.10 --non-interactive --deep --web=both
+
+  เสริมข้อมูล IP ที่เจอ (ประเทศ/องค์กร/คะแนนความเสี่ยง)
+    ./IP_Intel.sh
+
+  สร้าง/อัปเดต dashboard อย่างเดียว
+    ./Micro_SOC_Report.sh
+
+  สร้าง dashboard + export csv + ส่ง Telegram (ต้องตั้ง TELEGRAM_BOT_TOKEN
+  และ TELEGRAM_CHAT_ID ไว้ก่อน)
+    ./Micro_SOC_Report.sh -e csv --telegram
+
+===========================================================================
+จบคู่มือ
+===========================================================================
